@@ -3,10 +3,13 @@ package rpcserver
 import (
 	"encoding/json"
 	"fmt"
-	"github.com/alecthomas/log4go"
-	"github.com/rs/cors"
 	"net/http"
 	"reflect"
+	"strings"
+
+	"github.com/alecthomas/log4go"
+	"github.com/rs/cors"
+	"github.com/tidwall/gjson"
 )
 
 var (
@@ -16,6 +19,8 @@ var (
 )
 
 type Rpcserver struct {
+	// url , 默认 /api/
+	Pattern        string
 	Port           int
 	ServiceMap     map[string]ServiceReg
 	CheckToken     func(token TOKEN) bool
@@ -37,7 +42,11 @@ func (self *Rpcserver) StartServer() (e error) {
 	}
 	c := self.makeCors()
 	mux := http.NewServeMux()
-	mux.HandleFunc("/api/", handlerFunc)
+	if self.Pattern != "" {
+		mux.HandleFunc(self.Pattern, handlerFunc)
+	} else {
+		mux.HandleFunc("/api/", handlerFunc)
+	}
 	h := c.Handler(mux)
 	host := fmt.Sprintf(":%d", self.Port)
 	log4go.Debug("host = %s", host)
@@ -55,77 +64,111 @@ func logServiceMap(m map[string]ServiceReg) {
 }
 
 func handlerFunc(w http.ResponseWriter, r *http.Request) {
-	var (
-		success *Success = &Success{Success: true}
-		ibody   interface{}
-	)
+	success := &Success{Success: true}
 	r.ParseForm()
 	body := r.FormValue("body")
-	if len(body) == 0 {
+	if body == "" {
 		success.Success = false
-	} else if err := json.Unmarshal([]byte(body), &ibody); err == nil {
-		mbody := ibody.(map[string]interface{})
-		log4go.Debug("mbody = %s", mbody)
-		var token TOKEN = ""
-		if tokenParam, ok := mbody["token"]; ok {
-			token = TOKEN(tokenParam.(string))
-		}
-		if service, ok := mbody["service"]; !ok {
+		success.Error("1000", "params of body notfound")
+	} else {
+		if serviceRes := gjson.Get(body, "service"); serviceRes.String() == "null" {
 			success.Error("1002", "service error or notfound")
-		} else if method, ok := mbody["method"]; !ok {
+		} else if methodRes := gjson.Get(body, "method"); methodRes.String() == "null" {
 			success.Error("1002", "method error or notfound")
 		} else {
-			s := service.(string)
-			m := method.(string)
+			s := serviceRes.String()
 			//TODO check service version
 			serviceReg, ok := this.ServiceMap[s]
 			if ok {
-				serviceObj := serviceReg.Service
-				refService := reflect.ValueOf(serviceObj)
-				refMethod := refService.MethodByName(m)
-				log4go.Debug("refService = %s", refService)
-				log4go.Debug("refMethod = %s", refMethod)
-				auth := false
-				if refMethod.IsValid() {
-					//TODO check method input/output of define
-					rmt := refMethod.Type()
-					inArr := make([]reflect.Value, rmt.NumIn())
-					for i := 0; i < rmt.NumIn(); i++ {
-						in := rmt.In(i)
-						var _token TOKEN
-						log4go.Debug("in = %s", in)
-						if in == reflect.TypeOf(_token) {
-							log4go.Debug("TODO: AuthFilter ========>")
-							inArr[i] = reflect.ValueOf(token)
-							auth = true
-						} else {
-							if params, ok := mbody["params"]; ok {
-								inArr[i] = reflect.ValueOf(params)
-							}
-						}
-					}
-					runservice := func() {
-						rtn := refMethod.Call(inArr)[0].Interface().(Success)
-						log4go.Debug("rtn =", rtn)
-						success = &rtn
-					}
-					if auth {
-						if this.CheckToken(token) {
-							runservice()
-						} else {
-							success.Error("1003", fmt.Sprintf("error token"))
-						}
-					} else {
-						runservice()
-					}
-				} else {
-					success.Error("1002", fmt.Sprintf("method notfond ;;; %s", m))
-				}
+				executeMethod(serviceReg, body, success)
+			} else {
+				success.Success = false
+				success.Error("1003", "service not reg")
 			}
 		}
-	} else {
-		log4go.Debug("mbody_err =", err)
-		success.Error("1001", fmt.Sprintf("Params format error ;;; %s", err))
 	}
 	success.ResponseAsJson(w)
+}
+
+func executeMethod(serviceReg ServiceReg, body string, success *Success) {
+	token := getToken(body)
+	methodName := gjson.Get(body, "method").String()
+	methodName = paserMethodName(methodName)
+	serviceObj := serviceReg.Service
+	refService := reflect.ValueOf(serviceObj)
+	refMethod := refService.MethodByName(methodName)
+	log4go.Debug("refService = %s, refMethod = %s", refService, refMethod)
+	auth := false
+	if refMethod.IsValid() {
+		rmt := refMethod.Type()
+		inArr := make([]reflect.Value, rmt.NumIn())
+		for i := 0; i < rmt.NumIn(); i++ {
+			in := rmt.In(i)
+			var _token TOKEN
+			log4go.Debug("in = %s", in)
+			if in == reflect.TypeOf(_token) {
+				log4go.Debug("TODO: AuthFilter ========>")
+				inArr[i] = reflect.ValueOf(token)
+				auth = true
+			} else if kind := in.Kind().String(); kind == "interface" || kind == "map" {
+				//interface{} 和 map[string]interface{} 就是序列化成 map 传递
+				if paramsRes := gjson.Get(body, "params"); paramsRes.String() != "null" {
+					target := map[string]interface{}{}
+					json.Unmarshal([]byte(paramsRes.String()), &target)
+					inArr[i] = reflect.ValueOf(target)
+				}
+			} else if kind == "string" {
+				// 字符串则直接传递 json 字符串
+				if paramsRes := gjson.Get(body, "params"); paramsRes.String() != "null" {
+					inArr[i] = reflect.ValueOf(paramsRes.String())
+				}
+			} else {
+				//TODO 2016-12-06 : 非常遗憾，当前版本还不能支持此功能
+				// 否则反射成 in 指定的 struct 类型
+				//if paramsRes := gjson.Get(body, "params"); paramsRes.String() != "null" {
+				//	inVal := reflect.New(in).Interface()
+				//	json.Unmarshal([]byte(paramsRes.String()), inVal)
+				//	inArr[i] = reflect.ValueOf(&inVal)
+				//}
+				success.Success = false
+				success.Error("TODO", "not support struct yet")
+				return
+			}
+		}
+		runservice := func() {
+			rtn := refMethod.Call(inArr)[0].Interface().(Success)
+			log4go.Debug("rtn = %s", rtn)
+			success.Sn = rtn.Sn
+			success.Success = rtn.Success
+			success.Entity = rtn.Entity
+		}
+		if auth {
+			if this.CheckToken(token) {
+				runservice()
+			} else {
+				success.Error("1003", fmt.Sprintf("error token"))
+			}
+		} else {
+			runservice()
+		}
+	} else {
+		success.Error("1002", fmt.Sprintf("method notfond ;;; %s", methodName))
+	}
+}
+
+func paserMethodName(s string) string {
+	b0 := s[0]
+	s0 := string(b0)
+	s0 = strings.ToUpper(s0)
+	sn := s[1:len(s)]
+	s = s0 + sn
+	return s
+}
+
+func getToken(body string) TOKEN {
+	var token TOKEN
+	if tokenRes := gjson.Get(body, "token"); tokenRes.String() != "null" {
+		token = TOKEN(tokenRes.String())
+	}
+	return token
 }
