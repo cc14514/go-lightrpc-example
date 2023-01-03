@@ -6,7 +6,7 @@ https://github.com/alecthomas/log4go 日志
 */
 import (
 	"fmt"
-	"go-lightrpc-example/service"
+	"github.com/cc14514/go-lightrpc-example/service"
 	"os"
 
 	"github.com/alecthomas/log4go"
